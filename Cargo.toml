@@ -1,0 +1,24 @@
+[package]
+name = "meme"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+io-uring = "0.7"
+libc = "0.2"
+hex = "0.4"
+
+[dev-dependencies]
+criterion = "0.5"
+tempfile = "3"
+rocksdb = "0.22"
+rand = "0.8"
+
+[[bench]]
+name = "lsm_throughput"
+harness = false
+
+[[bench]]
+name = "rocksdb_comparison"
+harness = false
