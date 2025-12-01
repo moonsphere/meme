@@ -11,7 +11,20 @@ This is an experimental LSM-tree storage engine written in Rust that leverages L
 
 ## Performance Results
 
-### vs RocksDB Production Configuration (Buffered I/O + Block Cache)
+### Write Performance (Sequential Put with Durability)
+
+| Mode | Throughput | Latency/1000 ops | Relative | Durability |
+|------|------------|------------------|----------|------------|
+| **meme group_commit** | **27,000 ops/s** | **37ms** | **30x faster** | Batched fsync |
+| meme sync | 890 ops/s | 1.12s | baseline | Per-write fsync |
+| RocksDB sync | 890 ops/s | 1.12s | same | Per-write fsync |
+| RocksDB async | 280,000 ops/s | 3.5ms | 315x | No fsync |
+
+**Group Commit provides 30x write throughput improvement while maintaining durability guarantees.**
+
+The key insight: fsync is the bottleneck (~1.1ms per call on NVMe). Group commit batches multiple writes before fsync, amortizing the cost across many operations.
+
+### Read Performance: vs RocksDB Production Configuration
 
 This is the most important comparison - RocksDB in its typical production configuration:
 
@@ -42,10 +55,11 @@ This is the most important comparison - RocksDB in its typical production config
 
 ### Key Insights
 
-1. **vs RocksDB Production**: meme is 22% faster than RocksDB's typical production configuration (buffered I/O + block cache)
-2. **Raw Disk I/O**: io_uring provides ~24% improvement over pread due to reduced syscall overhead and kernel polling
-3. **Cache Efficiency**: meme's simpler code path and pre-parsed block cache provide consistent 22% improvement
-4. **OS Page Cache Overhead**: RocksDB with only OS page cache (no block cache) is 4x slower than with block cache
+1. **Group Commit**: 30x write throughput improvement by batching fsync operations
+2. **vs RocksDB Production**: meme is 22% faster than RocksDB's typical production configuration (buffered I/O + block cache)
+3. **Raw Disk I/O**: io_uring provides ~24% improvement over pread due to reduced syscall overhead and kernel polling
+4. **Cache Efficiency**: meme's simpler code path and pre-parsed block cache provide consistent 22% improvement
+5. **OS Page Cache Overhead**: RocksDB with only OS page cache (no block cache) is 4x slower than with block cache
 
 ## Architecture
 
@@ -235,8 +249,31 @@ pub struct LsmOptions {
     pub block_cache_slots: usize,
     /// Force SINGLE_ISSUER flag (default: false)
     pub force_single_issuer: bool,
+    /// WAL durability mode (default: Sync)
+    pub wal_durability: WalDurability,
+}
+
+pub enum WalDurability {
+    /// Sync after every write (safest, ~900 ops/s)
+    Sync,
+    /// Batch writes and sync periodically (~27K ops/s)
+    /// - timeout: max time before sync (default: 1ms)
+    /// - batch_size: max entries before sync (default: 32)
+    GroupCommit { timeout: Duration, batch_size: usize },
+    /// No sync (fastest, data may be lost on crash)
+    NoSync,
 }
 ```
+
+### Durability Modes
+
+| Mode | Throughput | Durability | Use Case |
+|------|------------|------------|----------|
+| Sync | ~900 ops/s | Per-write | Financial transactions |
+| GroupCommit | ~27K ops/s | Batched (1ms window) | General workloads |
+| NoSync | ~280K ops/s | None | Caching, ephemeral data |
+
+**Recommended**: `GroupCommit` for most workloads. It provides 30x better throughput than `Sync` while limiting potential data loss to the last 1ms of writes.
 
 ### Memory Requirements
 

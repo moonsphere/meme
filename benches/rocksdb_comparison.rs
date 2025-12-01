@@ -9,9 +9,10 @@
 //!   * hard memlock unlimited
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use meme::{LsmDb, LsmOptions};
+use meme::{LsmDb, LsmOptions, WalDurability};
 use rand::prelude::*;
 use rocksdb::{Options, DB};
+use std::time::Duration;
 use tempfile::TempDir;
 
 const VALUE_SIZE: usize = 100;
@@ -26,9 +27,36 @@ fn make_value(rng: &mut impl Rng) -> Vec<u8> {
     buf
 }
 
-/// Create LsmOptions for benchmarks with 1MB cache (default, fits 8MB memlock)
+/// Create LsmOptions for benchmarks with minimal cache to fit memlock limits
+/// Uses Sync durability (fsync after every write) for fair comparison
 fn bench_lsm_options() -> LsmOptions {
-    LsmOptions::default() // 64 slots × 16KB = 1MB cache
+    LsmOptions {
+        block_cache_slots: 16, // Minimal cache to fit memlock limits
+        force_single_issuer: false,
+        wal_durability: WalDurability::Sync,
+    }
+}
+
+/// Create LsmOptions with group commit for high throughput writes
+/// Batches writes and syncs every 1ms or 32 entries
+fn bench_lsm_options_group_commit() -> LsmOptions {
+    LsmOptions {
+        block_cache_slots: 16, // Minimal cache to fit memlock limits
+        force_single_issuer: false,
+        wal_durability: WalDurability::GroupCommit {
+            timeout: Duration::from_millis(1),
+            batch_size: 32,
+        },
+    }
+}
+
+/// Create LsmOptions with no sync (fastest, but data may be lost on crash)
+fn bench_lsm_options_no_sync() -> LsmOptions {
+    LsmOptions {
+        block_cache_slots: 16, // Minimal cache to fit memlock limits
+        force_single_issuer: false,
+        wal_durability: WalDurability::NoSync,
+    }
 }
 
 /// Create LsmOptions with larger cache (requires more memlock)
@@ -145,8 +173,8 @@ fn bench_sequential_put(c: &mut Criterion) {
     for num_keys in [1000, 5000] {
         group.throughput(Throughput::Elements(num_keys as u64));
 
-        // meme with sync WAL (default behavior)
-        group.bench_with_input(BenchmarkId::new("meme", num_keys), &num_keys, |b, &n| {
+        // meme with sync WAL (default behavior - fsync after every write)
+        group.bench_with_input(BenchmarkId::new("meme_sync", num_keys), &num_keys, |b, &n| {
             let mut rng = StdRng::seed_from_u64(42);
             let values: Vec<Vec<u8>> = (0..n).map(|_| make_value(&mut rng)).collect();
             b.iter_batched(
@@ -167,7 +195,53 @@ fn bench_sequential_put(c: &mut Criterion) {
             )
         });
 
-        // RocksDB with sync WAL (fair comparison)
+        // meme with group commit (batch writes, sync every 1ms or 32 entries)
+        group.bench_with_input(BenchmarkId::new("meme_group_commit", num_keys), &num_keys, |b, &n| {
+            let mut rng = StdRng::seed_from_u64(42);
+            let values: Vec<Vec<u8>> = (0..n).map(|_| make_value(&mut rng)).collect();
+            b.iter_batched(
+                || {
+                    let dir = TempDir::new().expect("tempdir");
+                    let mut db = LsmDb::open(dir.path(), bench_lsm_options_group_commit()).expect("open");
+                    db.set_flush_limit(n * 2);
+                    (dir, db, values.clone())
+                },
+                |(dir, mut db, vals)| {
+                    for i in 0..n {
+                        db.put(&make_key(i), &vals[i]).expect("put");
+                    }
+                    // Ensure all pending writes are synced before measuring
+                    db.sync().expect("sync");
+                    drop(db);
+                    drop(dir);
+                },
+                criterion::BatchSize::SmallInput,
+            )
+        });
+
+        // meme with no sync (fastest, but data may be lost on crash)
+        group.bench_with_input(BenchmarkId::new("meme_no_sync", num_keys), &num_keys, |b, &n| {
+            let mut rng = StdRng::seed_from_u64(42);
+            let values: Vec<Vec<u8>> = (0..n).map(|_| make_value(&mut rng)).collect();
+            b.iter_batched(
+                || {
+                    let dir = TempDir::new().expect("tempdir");
+                    let mut db = LsmDb::open(dir.path(), bench_lsm_options_no_sync()).expect("open");
+                    db.set_flush_limit(n * 2);
+                    (dir, db, values.clone())
+                },
+                |(dir, mut db, vals)| {
+                    for i in 0..n {
+                        db.put(&make_key(i), &vals[i]).expect("put");
+                    }
+                    drop(db);
+                    drop(dir);
+                },
+                criterion::BatchSize::SmallInput,
+            )
+        });
+
+        // RocksDB with sync WAL (fair comparison with meme_sync)
         group.bench_with_input(BenchmarkId::new("rocksdb_sync", num_keys), &num_keys, |b, &n| {
             let mut rng = StdRng::seed_from_u64(42);
             let values: Vec<Vec<u8>> = (0..n).map(|_| make_value(&mut rng)).collect();
@@ -189,7 +263,7 @@ fn bench_sequential_put(c: &mut Criterion) {
             )
         });
 
-        // RocksDB without sync (async WAL - default RocksDB behavior)
+        // RocksDB without sync (async WAL - default RocksDB behavior, fair comparison with meme_no_sync)
         group.bench_with_input(BenchmarkId::new("rocksdb_async", num_keys), &num_keys, |b, &n| {
             let mut rng = StdRng::seed_from_u64(42);
             let values: Vec<Vec<u8>> = (0..n).map(|_| make_value(&mut rng)).collect();

@@ -5,7 +5,7 @@ use std::{
     path::Path,
     ptr::NonNull,
     sync::OnceLock,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, Result};
@@ -27,6 +27,39 @@ const BATCH_FLUSH_THRESHOLD: usize = 64 * 1024;
 /// Alignment required for O_DIRECT + IOPOLL
 const WAL_ALIGN: usize = 4096;
 
+/// Default group commit timeout (1ms)
+#[allow(dead_code)]
+const DEFAULT_GROUP_COMMIT_TIMEOUT: Duration = Duration::from_millis(1);
+
+/// Default group commit batch size (32 entries)
+#[allow(dead_code)]
+const DEFAULT_GROUP_COMMIT_BATCH_SIZE: usize = 32;
+
+/// WAL durability mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalDurability {
+    /// Sync after every write (safest, slowest)
+    /// Each put() waits for fsync to complete
+    Sync,
+    
+    /// Group commit: batch writes and sync periodically
+    /// Writes are buffered and synced when:
+    /// - Batch size threshold is reached
+    /// - Timeout expires
+    /// - Manual sync() is called
+    /// This provides a good balance of durability and performance
+    GroupCommit {
+        /// Maximum time to wait before syncing
+        timeout: Duration,
+        /// Maximum number of entries before syncing
+        batch_size: usize,
+    },
+    
+    /// No sync (fastest, least durable)
+    /// Data may be lost on crash
+    NoSync,
+}
+
 pub struct WalWriter {
     ring: std::sync::Arc<IoRingHandle>,
     file: File,
@@ -45,6 +78,10 @@ pub struct WalWriter {
     pending_size: usize,
     
     buffer_size: usize,
+    
+    // Group commit state
+    durability: WalDurability,
+    last_sync: Instant,
 }
 
 // Safety: WalWriter owns the buffers and ensures proper synchronization
@@ -69,11 +106,38 @@ macro_rules! wal_dbg {
 }
 
 impl WalWriter {
+    /// Create a new WAL writer with Sync durability (backward compatible)
+    #[allow(dead_code)]
     pub fn new(
         path: &Path,
         ring: std::sync::Arc<IoRingHandle>,
         fixed_slot: u32,
         use_iopoll: bool,
+    ) -> Result<Self> {
+        Self::with_durability(path, ring, fixed_slot, use_iopoll, WalDurability::Sync)
+    }
+    
+    /// Create a new WAL writer with group commit mode (for high throughput)
+    #[allow(dead_code)]
+    pub fn new_group_commit(
+        path: &Path,
+        ring: std::sync::Arc<IoRingHandle>,
+        fixed_slot: u32,
+        use_iopoll: bool,
+    ) -> Result<Self> {
+        Self::with_durability(path, ring, fixed_slot, use_iopoll, WalDurability::GroupCommit {
+            timeout: DEFAULT_GROUP_COMMIT_TIMEOUT,
+            batch_size: DEFAULT_GROUP_COMMIT_BATCH_SIZE,
+        })
+    }
+    
+    /// Create a new WAL writer with specified durability mode
+    pub fn with_durability(
+        path: &Path,
+        ring: std::sync::Arc<IoRingHandle>,
+        fixed_slot: u32,
+        use_iopoll: bool,
+        durability: WalDurability,
     ) -> Result<Self> {
         let file = if use_iopoll {
             open_o_direct_dsync(path, false)?
@@ -121,11 +185,57 @@ impl WalWriter {
             pending: Vec::with_capacity(100),
             pending_size: 0,
             buffer_size: WAL_BUFFER_SIZE,
+            durability,
+            last_sync: Instant::now(),
         })
+    }
+    
+    /// Set durability mode
+    pub fn set_durability(&mut self, durability: WalDurability) {
+        self.durability = durability;
+    }
+    
+    /// Get current durability mode
+    pub fn durability(&self) -> WalDurability {
+        self.durability
+    }
+    
+    /// Check if there are pending entries that need to be synced
+    pub fn needs_sync(&self) -> bool {
+        !self.pending.is_empty()
+    }
+    
+    /// Sync pending entries if timeout has expired (for group commit)
+    /// Returns true if a sync was performed
+    #[allow(dead_code)]
+    pub fn maybe_sync(&mut self) -> Result<bool> {
+        if self.pending.is_empty() {
+            return Ok(false);
+        }
+        
+        match self.durability {
+            WalDurability::GroupCommit { timeout, batch_size } => {
+                if self.pending.len() >= batch_size || self.last_sync.elapsed() >= timeout {
+                    self.flush()?;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+            _ => {
+                self.flush()?;
+                Ok(true)
+            }
+        }
+    }
+    
+    /// Force sync all pending entries
+    pub fn sync(&mut self) -> Result<()> {
+        self.flush()
     }
 
     /// Append an entry to the pending batch.
-    /// If the batch gets too large, it may trigger a flush.
+    /// Depending on durability mode, may trigger a flush.
     pub fn append(&mut self, entry: WalEntry) -> Result<()> {
         let encoded_len = entry.encoded_len();
         if self.pending_size + encoded_len > self.buffer_size {
@@ -136,8 +246,27 @@ impl WalWriter {
         self.pending_size += encoded_len;
         self.pending.push(entry);
         
-        if self.pending_size >= BATCH_FLUSH_THRESHOLD {
-            self.flush()?;
+        // Check if we should flush based on durability mode
+        match self.durability {
+            WalDurability::Sync => {
+                // Sync mode: flush immediately
+                self.flush()?;
+            }
+            WalDurability::GroupCommit { timeout, batch_size } => {
+                // Group commit: flush if batch size reached or timeout expired
+                let should_flush = self.pending.len() >= batch_size
+                    || self.last_sync.elapsed() >= timeout
+                    || self.pending_size >= BATCH_FLUSH_THRESHOLD;
+                if should_flush {
+                    self.flush()?;
+                }
+            }
+            WalDurability::NoSync => {
+                // NoSync: flush when buffer threshold reached (no fsync)
+                if self.pending_size >= BATCH_FLUSH_THRESHOLD {
+                    self.flush_no_sync()?;
+                }
+            }
         }
         
         Ok(())
@@ -198,6 +327,39 @@ impl WalWriter {
         Ok((padded_len, payload_len))
     }
 
+    /// Flush pending entries to disk without fsync (for NoSync mode).
+    /// Data is written but may be lost on crash.
+    fn flush_no_sync(&mut self) -> Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+
+        // Encode with frame header (4-byte payload length)
+        let mut payload = Vec::new();
+        for entry in &self.pending {
+            payload.extend_from_slice(&entry.encode());
+        }
+        let payload_len = payload.len();
+        let total_len = 4 + payload_len;
+        let padded_len = align_up(total_len, WAL_ALIGN);
+        
+        let mut buf = Vec::with_capacity(padded_len);
+        buf.extend_from_slice(&(payload_len as u32).to_le_bytes());
+        buf.extend_from_slice(&payload);
+        buf.resize(padded_len, 0); // Zero padding
+        
+        use std::io::{Seek, SeekFrom, Write};
+        self.file.seek(SeekFrom::Start(self.offset))?;
+        self.file.write_all(&buf)?;
+        // No sync_data() call - data may be lost on crash
+        self.offset += padded_len as u64;
+        self.pending.clear();
+        self.pending_size = 0;
+        self.current_buf = 0;
+        
+        Ok(())
+    }
+
     /// Flush pending entries to disk.
     /// This uses double buffering to pipeline writes if possible.
     pub fn flush(&mut self) -> Result<()> {
@@ -230,6 +392,7 @@ impl WalWriter {
             self.pending.clear();
             self.pending_size = 0;
             self.current_buf = 0;
+            self.last_sync = Instant::now();
             return Ok(());
         }
 
@@ -248,6 +411,7 @@ impl WalWriter {
         self.offset += padded_len as u64;
         self.pending.clear();
         self.pending_size = 0;
+        self.last_sync = Instant::now();
         
         // Switch to next buffer
         self.current_buf = 1 - self.current_buf;
@@ -256,6 +420,7 @@ impl WalWriter {
     }
 
     // Legacy support for LsmDb
+    #[allow(dead_code)]
     pub fn append_batch(&mut self, batch: &[WalEntry], _timeout: Duration) -> Result<()> {
         for entry in batch {
             self.append(entry.clone())?;

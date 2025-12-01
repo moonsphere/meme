@@ -30,6 +30,7 @@ use storage::StoragePaths;
 use wal::WalWriter;
 
 pub use sst::{PipelinedIterator, BLOCK_SIZE as SST_BLOCK_SIZE};
+pub use wal::WalDurability;
 
 pub fn run() -> Result<()> {
     let (data_root, opts) = parse_args();
@@ -112,6 +113,11 @@ pub struct LsmOptions {
     /// For production with unlimited memlock, use 4096+ slots.
     pub block_cache_slots: usize,
     pub force_single_issuer: bool,
+    /// WAL durability mode.
+    /// - Sync: fsync after every write (safest, slowest ~900 ops/s)
+    /// - GroupCommit: batch writes and fsync periodically (balanced, ~50K-100K ops/s)
+    /// - NoSync: no fsync (fastest, data may be lost on crash)
+    pub wal_durability: WalDurability,
 }
 
 impl Default for LsmOptions {
@@ -122,6 +128,29 @@ impl Default for LsmOptions {
             // (4 SQPOLL rings use ~4-6MB, leaving ~2-4MB for cache + buffers)
             block_cache_slots: 64,
             force_single_issuer: false,
+            // Default to Sync for backward compatibility and safety
+            wal_durability: WalDurability::Sync,
+        }
+    }
+}
+
+impl LsmOptions {
+    /// Create options with group commit for high throughput writes
+    pub fn with_group_commit() -> Self {
+        Self {
+            wal_durability: WalDurability::GroupCommit {
+                timeout: Duration::from_millis(1),
+                batch_size: 32,
+            },
+            ..Default::default()
+        }
+    }
+    
+    /// Create options with no sync for maximum throughput (unsafe)
+    pub fn with_no_sync() -> Self {
+        Self {
+            wal_durability: WalDurability::NoSync,
+            ..Default::default()
         }
     }
 }
@@ -242,7 +271,13 @@ impl LsmDb {
         let wal_ring = scheduler.ring(Lane::Wal);
         // WalWriter now manages its own buffer slots
         // WAL uses SQPOLL + IOPOLL with O_DIRECT + O_DSYNC (no explicit fsync needed)
-        let wal = WalWriter::new(paths.wal_path(), wal_ring.clone(), 0, true)?;
+        let wal = wal::WalWriter::with_durability(
+            paths.wal_path(),
+            wal_ring.clone(),
+            0,
+            true,
+            options.wal_durability,
+        )?;
 
         let mut memtable = MemTable::new();
         let buf = util::read_file(paths.wal_path())?;
@@ -300,14 +335,40 @@ impl LsmDb {
     pub fn set_flush_limit(&mut self, limit: usize) {
         self.flush_limit = limit.max(1);
     }
+    
+    /// Set WAL durability mode at runtime
+    pub fn set_wal_durability(&mut self, durability: WalDurability) {
+        self.wal.set_durability(durability);
+    }
+    
+    /// Get current WAL durability mode
+    pub fn wal_durability(&self) -> WalDurability {
+        self.wal.durability()
+    }
 
+    /// Put a key-value pair.
+    /// Durability depends on the configured WalDurability mode:
+    /// - Sync: waits for fsync after each write (~900 ops/s)
+    /// - GroupCommit: batches writes and syncs periodically (~50K-100K ops/s)
+    /// - NoSync: no fsync, data may be lost on crash
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         let entry = self.memtable.put(key, value);
-        self.wal.append_batch(&[entry], Duration::from_micros(200))?;
+        self.wal.append(entry)?;
         if self.memtable.len() >= self.flush_limit {
             self.flush_memtable()?;
         }
         Ok(())
+    }
+    
+    /// Force sync any pending WAL entries to disk.
+    /// Call this after a batch of puts to ensure durability.
+    pub fn sync(&mut self) -> Result<()> {
+        self.wal.sync()
+    }
+    
+    /// Check if there are pending WAL entries that need to be synced
+    pub fn needs_sync(&self) -> bool {
+        self.wal.needs_sync()
     }
 
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
